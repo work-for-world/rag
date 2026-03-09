@@ -2,24 +2,25 @@ import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List
+
 import requests
 from dotenv import load_dotenv
-from typing import Dict, List
 from openai import OpenAI
-from langchain_core.embeddings import Embeddings
-from langchain_community.retrievers import BM25Retriever
 from langchain_chroma import Chroma
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableLambda
+from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
+from langchain_openai import ChatOpenAI
 
 # 加载环境变量
 load_dotenv()
 
 # ================= 配置区域（与 indexer.py 一致）=================
-BASE_DIR = r"E:\python_code\langchain"
+BASE_DIR = os.getenv("BASE_DIR", os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CHROMA_PATH_QIAN = os.path.join(BASE_DIR, "chroma_db_qwen3")
 DEFAULT_CHROMA_PATH_CUSTOM = os.path.join(BASE_DIR, "chroma_db_custom")
 
@@ -47,9 +48,12 @@ BM25_K = int(os.getenv("BM25_K", "4"))
 VECTOR_K = int(os.getenv("VECTOR_K", "8"))
 FINAL_TOP_K = int(os.getenv("FINAL_TOP_K", "4"))
 MIN_FINAL_TOP_K = int(os.getenv("MIN_FINAL_TOP_K", "3"))
+
+
 # ================= 百炼 Embedding 类（与 indexer 一致）=================
 class DashScopeEmbeddings(Embeddings):
     """使用阿里百炼 text-embedding-v4，用于 Chroma 查询与加载。"""
+
     BATCH_SIZE = 10
 
     def __init__(self, api_key: str, base_url: str, model: str = "text-embedding-v4"):
@@ -73,6 +77,7 @@ class DashScopeEmbeddings(Embeddings):
 
 class CustomAPIEmbeddings(Embeddings):
     """通过 HTTP API 调用的自定义 Embedding。"""
+
     BATCH_SIZE = 10
 
     def __init__(self, api_url: str, api_key: str, model_name: str):
@@ -132,8 +137,8 @@ def create_embeddings():
         model=QIAN_EMBED_MODEL,
     )
 
-# ================= 核心逻辑 =================
 
+# ================= 核心逻辑 =================
 def load_existing_vectorstore():
     """加载已存在的向量库"""
     if not os.path.exists(CHROMA_PATH):
@@ -144,29 +149,30 @@ def load_existing_vectorstore():
     embeddings = create_embeddings()
     if not embeddings:
         return None
-    
+
     try:
         db = Chroma(persist_directory=CHROMA_PATH, embedding_function=embeddings)
         count = db._collection.count()
         if count == 0:
             print("⚠️ 向量库为空，请先运行 indexer.py 导入数据。")
             return None
-        
+
         print(f"✅ 成功加载向量库，包含 {count} 个片段。")
         return db
-    
+
     except Exception as e:
         error_msg = str(e)
         if "dimension" in error_msg.lower():
             print(f"\n❌ 严重错误: 向量维度不匹配! ({error_msg})")
             print("💡 原因: 当前模型输出的维度与创建数据库时的维度不一致。")
             print("🔧 解决方法: ")
-            print(f"   1. 删除旧的向量库文件夹: {CHROMA_PATH}")
-            print("   2. 确保 .env 中的模型配置正确。")
-            print("   3. 重新运行 python indexer.py 重建索引。")
+            print(f" 1. 删除旧的向量库文件夹: {CHROMA_PATH}")
+            print(" 2. 确保 .env 中的模型配置正确。")
+            print(" 3. 重新运行 python indexer.py 重建索引。")
         else:
             print(f"❌ 加载向量库失败: {e}")
         return None
+
 
 def create_hybrid_retriever(db):
     """构建混合检索器：BM25 + 向量召回，再调用千问 rerank 重排。"""
@@ -304,7 +310,9 @@ def create_hybrid_retriever(db):
                             results = output.get("results") or []
                         elif isinstance(data.get("results"), list):
                             results = data.get("results") or []
-                        elif isinstance(data.get("data"), dict) and isinstance(data["data"].get("results"), list):
+                        elif isinstance(data.get("data"), dict) and isinstance(
+                            data["data"].get("results"), list
+                        ):
                             results = data["data"].get("results") or []
 
                     for item in results:
@@ -317,7 +325,9 @@ def create_hybrid_retriever(db):
                         metadata = dict(base_doc.metadata or {})
                         metadata["rerank_score"] = round(float(item.get("relevance_score", 0.0)), 6)
                         metadata["rerank_model"] = rerank_model
-                        reranked_docs.append(Document(page_content=base_doc.page_content, metadata=metadata))
+                        reranked_docs.append(
+                            Document(page_content=base_doc.page_content, metadata=metadata)
+                        )
 
                     if reranked_docs:
                         rerank_ok = True
@@ -331,8 +341,7 @@ def create_hybrid_retriever(db):
             else:
                 # rerank 失败时：按向量分排序，尽量不差于纯向量检索
                 candidates.sort(
-                    key=lambda d: float((d.metadata or {}).get("vector_relevance", 0.0),
-                    ),
+                    key=lambda d: float((d.metadata or {}).get("vector_relevance", 0.0)),
                     reverse=True,
                 )
                 selected = candidates[:final_top_k]
@@ -370,19 +379,20 @@ def create_hybrid_retriever(db):
     except Exception as e:
         print(f"❌ 构建混合检索失败: {e}")
         print("仅使用向量检索...")
-        return db.as_retriever(search_kwargs={"k": int(os.getenv('FINAL_TOP_K', '4'))})
+        return db.as_retriever(search_kwargs={"k": int(os.getenv("FINAL_TOP_K", "4"))})
+
 
 def create_rag_chain(retriever, llm):
     # 第一次调用：基于 memory 改写用户问题（单条或拆成多条）
     rewrite_template = """你是查询改写助手。根据【历史会话】理解用户当前问题的上下文，如果用户当前的问题中存在多个问题，将这多个问题拆成多条检索问句；若只有一个问题则保持一条（可结合上下文略作补全，不改变原意）。
-    只输出严格 JSON，不要任何解释。格式：{{"queries": ["问句1", "问句2", ...]}}。
+只输出严格 JSON，不要任何解释。格式：{{"queries": ["问句1", "问句2", ...]}}。
 
-    【历史会话】
-    {history}
+【历史会话】
+{history}
 
-    【用户当前问题】
-    {question}
-    """
+【用户当前问题】
+{question}
+"""
     rewrite_prompt = ChatPromptTemplate.from_template(rewrite_template)
     rewrite_chain = rewrite_prompt | llm | StrOutputParser()
 
@@ -396,22 +406,22 @@ def create_rag_chain(retriever, llm):
 回答策略与结构要求：
 1) **多问题拆解**：如果用户问题包含多个独立子问题（例如“怎么重置密码？另外报错代码0x800是什么意思？”），请分别针对每个子问题查找对应的参考信息，并分段进行回复，不要混为一谈。
 2) **动态内容结构**：根据内容类型自动选择最合适的格式，严禁机械地全部使用“步骤一、步骤二”：
-   - **操作指引类**（如“如何安装”、“怎么配置”）：必须使用步骤化输出（步骤 1、步骤 2...），每步一句到两句，简洁明确。
-   - **原因/概念/列表类**（如“为什么失败”、“有哪些政策”）：请使用分点列表（• 或 1. 2. 3.）进行阐述，清晰罗列关键点。
-   - **简单事实类**（如“服务台电话是多少”）：直接给出明确结论，无需分点或步骤。
+ - **操作指引类**（如“如何安装”、“怎么配置”）：必须使用步骤化输出（步骤 1、步骤 2...），每步一句到两句，简洁明确。
+ - **原因/概念/列表类**（如“为什么失败”、“有哪些政策”）：请使用分点列表（• 或 1. 2. 3.）进行阐述，清晰罗列关键点。
+ - **简单事实类**（如“服务台电话是多少”）：直接给出明确结论，无需分点或步骤。
 3) **图片路径严格规范**（最高优先级）：
-   - 触发条件：只要参考信息或生成的步骤中包含图片引用，必须紧跟在该相关段落/步骤后逐行输出。
-   - 格式要求：每张图片独占一行，严格格式为：`[图片地址] 绝对路径`
-   - 路径转换：
-     * 图片根目录固定为：“E:\python_code\langchain\plc”
-     * 若参考信息中是相对路径，必须拼接为该根目录下的绝对路径。
-     * **强烈建议统一使用正斜杠 `/` 输出路径**（例如 `E:/python_code/langchain/plc/.../image001.png`），防止转义错误。
-   - 完整性约束：
-     * 必须保留所有提到的图片，禁止丢失、合并或省略。
-     * 输出路径时必须保持原始字符完整，不得新增/删除字符，不得断行，不得把一个路径拆成两行。
-     * 若同一行中有多个 [图片地址] 标记，必须识别并分别单独输出为多行。
-   - 绝对路径示例：
-     [图片地址] E:/python_code/langchain/plc/知识库/it指引(1)/网络/无线网络/改了域密码后手机wifi连不上了/image001.png
+ - 触发条件：只要参考信息或生成的步骤中包含图片引用，必须紧跟在该相关段落/步骤后逐行输出。
+ - 格式要求：每张图片独占一行，严格格式为：`[图片地址] 绝对路径`
+ - 路径转换：
+   * 图片根目录固定为：“E:\python_code\langchain\plc”
+   * 若参考信息中是相对路径，必须拼接为该根目录下的绝对路径。
+   * **强烈建议统一使用正斜杠 `/` 输出路径**（例如 `E:/python_code/langchain/plc/.../image001.png`），防止转义错误。
+ - 完整性约束：
+   * 必须保留所有提到的图片，禁止丢失、合并或省略。
+   * 输出路径时必须保持原始字符完整，不得新增/删除字符，不得断行，不得把一个路径拆成两行。
+   * 若同一行中有多个 [图片地址] 标记，必须识别并分别单独输出为多行。
+ - 绝对路径示例：
+[图片地址] E:/python_code/langchain/plc/知识库/it指引(1)/网络/无线网络/改了域密码后手机wifi连不上了/image001.png
 4) **真实性约束**：不要编造图片路径、系统入口、账号策略等信息。若参考信息不足，明确说明“知识库未提供完整信息”，并告知用户联系 IT 服务台。
 5) **语言风格**：专业、礼貌、面向业务同事，避免过度技术黑话。
 
@@ -429,16 +439,16 @@ def create_rag_chain(retriever, llm):
     summary_prompt = ChatPromptTemplate.from_template(
         """你是对话记忆压缩助手。请在不遗漏关键业务信息的前提下，压缩历史会话。
 
-        已有摘要：
-        {existing_summary}
+已有摘要：
+{existing_summary}
 
-        新增对话：
-        {new_turns}
+新增对话：
+{new_turns}
 
-        请输出更新后的精简摘要，要求：
-        1) 保留用户目标、已确认事实、关键约束、未解决问题；
-        2) 删除寒暄和重复表达；
-        3) 使用中文，控制在 {max_tokens} token 以内（尽量简洁）。
+请输出更新后的精简摘要，要求：
+1) 保留用户目标、已确认事实、关键约束、未解决问题；
+2) 删除寒暄和重复表达；
+3) 使用中文，控制在 {max_tokens} token 以内（尽量简洁）。
 """
     )
     summary_chain = summary_prompt | llm | StrOutputParser()
@@ -481,8 +491,6 @@ def create_rag_chain(retriever, llm):
             score_text = f" | {' | '.join(score_parts)}" if score_parts else ""
             blocks.append(f"[片段{i}] 来源: {source}{score_text}\n{(d.page_content or '').strip()}")
         context_text = "\n\n---\n\n".join(blocks)
-        # print("检索到的内容:")
-        # print(context_text)
         return context_text
 
     def _serialize_turns(turns: List[Dict[str, str]]) -> str:
@@ -602,13 +610,12 @@ def create_rag_chain(retriever, llm):
             docs = retriever.invoke(queries[0])[:single_top_k]
 
         context = _format_docs(docs)
-        answer = answer_chain.invoke(
-            {"context": context, "history": history_text, "question": question}
-        )
+        answer = answer_chain.invoke({"context": context, "history": history_text, "question": question})
         memory["turns"].append({"q": question, "a": answer})
         return answer
 
     return RunnableLambda(_invoke_with_memory)
+
 
 def main():
     # 1. 检查必要的环境变量
@@ -641,38 +648,38 @@ def main():
     except Exception as e:
         print(f"❌ LLM 初始化失败: {e}")
         return
-    
+
     # 5. 构建链
     rag_chain = create_rag_chain(retriever, llm)
-    
+
     # 6. 交互循环
-    print("\n" + "="*50)
-    print(f"🎉 RAG 系统已就绪！")
+    print("\n" + "=" * 50)
+    print("🎉 RAG 系统已就绪！")
     if EMBEDDING_PROVIDER == "custom":
-        print(f"   - Embedding: {EMBED_MODEL_NAME} (@ {EMBED_API_URL}) [custom]")
+        print(f" - Embedding: {EMBED_MODEL_NAME} (@ {EMBED_API_URL}) [custom]")
     else:
-        print(f"   - Embedding: {QIAN_EMBED_MODEL} (@ {QIAN_BASE_URL}) [qian]")
-    print(f"   - Vector DB: {CHROMA_PATH}")
-    print(f"   - LLM: {LLM_MODEL_NAME}")
+        print(f" - Embedding: {QIAN_EMBED_MODEL} (@ {QIAN_BASE_URL}) [qian]")
+    print(f" - Vector DB: {CHROMA_PATH}")
+    print(f" - LLM: {LLM_MODEL_NAME}")
     # print("💡 输入 'quit' 退出；输入 'memory' 或 '查看记忆' 可查看当前记忆（调试）。")
     print("💡 输入 'quit' 退出;")
-    print("="*50)
-    
+    print("=" * 50)
+
     while True:
         try:
             query = input("\n❓ 请输入问题: ")
-            if query.lower() in ['quit', 'exit', 'q']:
+            if query.lower() in ["quit", "exit", "q"]:
                 break
             if not query.strip():
                 continue
-            
+
             print("⏳ 思考中...", end="\r")
             response = rag_chain.invoke(query)
-            
-            print(" " * 20, end="\r") # 清除"思考中"
+
+            print(" " * 20, end="\r")  # 清除"思考中"
             print("\n💡 回答:")
             print(response)
-            
+
         except KeyboardInterrupt:
             break
         except Exception as e:
@@ -680,6 +687,7 @@ def main():
             # 打印详细 traceback 以便调试本地接口问题
             # import traceback
             # traceback.print_exc()
+
 
 if __name__ == "__main__":
     main()

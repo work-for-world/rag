@@ -1,4 +1,3 @@
-import os
 import re
 from pathlib import Path
 from typing import Any
@@ -159,7 +158,9 @@ def _looks_like_rel_image_fragment(text: str) -> bool:
         return False
     if re.match(r"^[A-Za-z]:[\\/]", stripped):
         return False
-    return bool(re.search(r"[\\/][^\\/\r\n]+\.(?:png|jpg|jpeg|gif|webp)$", stripped, flags=re.IGNORECASE))
+    return bool(
+        re.search(r"[\\/][^\\/\r\n]+\.(?:png|jpg|jpeg|gif|webp)$", stripped, flags=re.IGNORECASE)
+    )
 
 
 def render_mixed_answer(answer: str, workspace_root: Path) -> bool:
