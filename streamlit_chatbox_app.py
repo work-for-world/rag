@@ -1,3 +1,4 @@
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -158,9 +159,7 @@ def _looks_like_rel_image_fragment(text: str) -> bool:
         return False
     if re.match(r"^[A-Za-z]:[\\/]", stripped):
         return False
-    return bool(
-        re.search(r"[\\/][^\\/\r\n]+\.(?:png|jpg|jpeg|gif|webp)$", stripped, flags=re.IGNORECASE)
-    )
+    return bool(re.search(r"[\\/][^\\/\r\n]+\.(?:png|jpg|jpeg|gif|webp)$", stripped, flags=re.IGNORECASE))
 
 
 def render_mixed_answer(answer: str, workspace_root: Path) -> bool:
@@ -236,8 +235,14 @@ def _render_assistant_message(msg: dict, workspace_root: Path, show_docs: list[A
         return
     with st.expander("检索到的参考片段", expanded=False):
         for idx, doc in enumerate(show_docs, start=1):
-            metadata = getattr(doc, "metadata", {}) or {}
-            source = metadata.get("source", "未知来源")
+            if isinstance(doc, dict):
+                metadata = doc.get("metadata", {}) or {}
+                source = doc.get("source") or metadata.get("source", "未知来源")
+                page_content = (doc.get("page_content", "") or "").strip()
+            else:
+                metadata = getattr(doc, "metadata", {}) or {}
+                source = metadata.get("source", "未知来源")
+                page_content = (getattr(doc, "page_content", "") or "").strip()
             vector_score = metadata.get("vector_relevance")
             rerank_score = metadata.get("rerank_score")
             score_parts = []
@@ -247,7 +252,7 @@ def _render_assistant_message(msg: dict, workspace_root: Path, show_docs: list[A
                 score_parts.append(f"Rerank置信度: `{rerank_score}`")
             score_text = " | ".join(score_parts) if score_parts else "无分数信息"
             st.markdown(f"**[{idx}] {source}** | {score_text}")
-            st.text((getattr(doc, "page_content", "") or "").strip())
+            st.text(page_content)
 
 
 def main() -> None:
@@ -304,11 +309,17 @@ def main() -> None:
 
         with st.chat_message("assistant"):
             with st.spinner("检索并生成回答中..."):
-                answer = rag_chain.invoke(prompt)
-            _render_assistant_message({"role": "assistant", "content": answer}, workspace_root, None)
+                rag_result = rag_chain.invoke(prompt)
+                if isinstance(rag_result, dict):
+                    answer = str(rag_result.get("answer", "")).strip()
+                    docs = rag_result.get("docs") or []
+                else:
+                    answer = str(rag_result).strip()
+                    docs = []
+            _render_assistant_message({"role": "assistant", "content": answer}, workspace_root, docs)
 
         st.session_state.messages.append({"role": "assistant", "content": answer})
-        st.session_state.last_docs = None
+        st.session_state.last_docs = docs
 
 
 if __name__ == "__main__":
