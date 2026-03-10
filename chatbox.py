@@ -1,10 +1,11 @@
 import json
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from dotenv import load_dotenv
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 from openai import OpenAI
 from langchain_core.embeddings import Embeddings
 from langchain_community.retrievers import BM25Retriever
@@ -14,6 +15,11 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableLambda
 from langchain_core.documents import Document
+
+try:
+    import jieba  # type: ignore
+except Exception:
+    jieba = None
 
 # 加载环境变量
 load_dotenv()
@@ -47,6 +53,15 @@ BM25_K = int(os.getenv("BM25_K", "4"))
 VECTOR_K = int(os.getenv("VECTOR_K", "8"))
 FINAL_TOP_K = int(os.getenv("FINAL_TOP_K", "4"))
 MIN_FINAL_TOP_K = int(os.getenv("MIN_FINAL_TOP_K", "3"))
+KEYWORD_OVERLAP_ENABLED = os.getenv("KEYWORD_OVERLAP_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+KEYWORD_OVERLAP_MIN_MATCH = int(os.getenv("KEYWORD_OVERLAP_MIN_MATCH", "2"))
+KEYWORD_INDEX_MAX_DOCS = int(os.getenv("KEYWORD_INDEX_MAX_DOCS", "20000"))
+KEYWORD_INDEX_MAX_CHARS_PER_DOC = int(os.getenv("KEYWORD_INDEX_MAX_CHARS_PER_DOC", "400"))
 # ================= 百炼 Embedding 类（与 indexer 一致）=================
 class DashScopeEmbeddings(Embeddings):
     """使用阿里百炼 text-embedding-v4，用于 Chroma 查询与加载。"""
@@ -131,6 +146,111 @@ def create_embeddings():
         base_url=QIAN_BASE_URL,
         model=QIAN_EMBED_MODEL,
     )
+
+
+_ASCII_TOKEN_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_\-]{1,}")
+_CJK_CHUNK_RE = re.compile(r"[\u4e00-\u9fff]+")
+_KEYWORD_STOPWORDS = {
+    "什么",
+    "怎么",
+    "如何",
+    "为啥",
+    "为何",
+    "请问",
+    "一下",
+    "这个",
+    "那个",
+    "可以",
+    "是否",
+    "有没有",
+    "还有",
+    "需要",
+    "我们",
+    "你们",
+    "他们",
+    "一个",
+    "一些",
+    "问题",
+    "现在",
+    "今天",
+    "就是",
+}
+
+
+def _extract_keyword_terms(text: str, max_terms: int = 64) -> Set[str]:
+    terms: Set[str] = set()
+    if not text:
+        return terms
+
+    lower_text = text.lower()
+    for token in _ASCII_TOKEN_RE.findall(lower_text):
+        token = token.strip()
+        if len(token) <= 1 or token in _KEYWORD_STOPWORDS:
+            continue
+        terms.add(token)
+        if len(terms) >= max_terms:
+            return terms
+
+    for chunk in _CJK_CHUNK_RE.findall(text):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if jieba:
+            for word in jieba.lcut(chunk):
+                word = word.strip().lower()
+                if len(word) <= 1 or word in _KEYWORD_STOPWORDS:
+                    continue
+                terms.add(word)
+                if len(terms) >= max_terms:
+                    return terms
+        else:
+            # 无 jieba 时使用 2-gram 回退，保持毫秒级开销且具备一定召回
+            if len(chunk) < 2:
+                continue
+            for i in range(len(chunk) - 1):
+                word = chunk[i : i + 2].lower()
+                if word in _KEYWORD_STOPWORDS:
+                    continue
+                terms.add(word)
+                if len(terms) >= max_terms:
+                    return terms
+
+    return terms
+
+
+def build_kb_keyword_index(db) -> Set[str]:
+    """从知识库文档与元数据中提取全局关键词集合，用于问题覆盖度检查。"""
+    terms: Set[str] = set()
+    try:
+        raw = db._collection.get(include=["documents", "metadatas"])
+        docs = raw.get("documents") or []
+        metas = raw.get("metadatas") or []
+        if len(metas) < len(docs):
+            metas = metas + [None] * (len(docs) - len(metas))
+
+        max_docs = max(1, KEYWORD_INDEX_MAX_DOCS)
+        max_chars = max(50, KEYWORD_INDEX_MAX_CHARS_PER_DOC)
+        for idx, (doc, meta) in enumerate(zip(docs, metas)):
+            if idx >= max_docs:
+                break
+            text = (doc or "")[:max_chars]
+            terms.update(_extract_keyword_terms(text, max_terms=80))
+            md = meta or {}
+            for key in ("source", "category", "title", "tags"):
+                value = md.get(key)
+                if isinstance(value, str):
+                    terms.update(_extract_keyword_terms(value, max_terms=30))
+                elif isinstance(value, list):
+                    for item in value:
+                        terms.update(_extract_keyword_terms(str(item), max_terms=20))
+
+        if jieba:
+            print(f"✅ 已构建关键词索引: {len(terms)} 条（分词: jieba）")
+        else:
+            print(f"✅ 已构建关键词索引: {len(terms)} 条（分词: 2-gram 回退，建议安装 jieba）")
+    except Exception as e:
+        print(f"⚠️ 构建关键词索引失败，将跳过覆盖度检查: {e}")
+    return terms
 
 # ================= 核心逻辑 =================
 
@@ -372,7 +492,7 @@ def create_hybrid_retriever(db):
         print("仅使用向量检索...")
         return db.as_retriever(search_kwargs={"k": int(os.getenv('FINAL_TOP_K', '4'))})
 
-def create_rag_chain(retriever, llm):
+def create_rag_chain(retriever, llm, kb_keywords: Set[str] | None = None):
     # 第一次调用：基于 memory 改写用户问题（单条或拆成多条）
     rewrite_template = """你是查询改写助手。根据【历史会话】理解用户当前问题的上下文，如果用户当前的问题中存在多个问题，将这多个问题拆成多条检索问句；若只有一个问题则保持一条（可结合上下文略作补全，不改变原意）。
     只输出严格 JSON，不要任何解释。格式：{{"queries": ["问句1", "问句2", ...]}}。
@@ -425,6 +545,34 @@ def create_rag_chain(retriever, llm):
 """
     prompt = ChatPromptTemplate.from_template(template)
     answer_chain = prompt | llm | StrOutputParser()
+    oos_prompt = ChatPromptTemplate.from_template(
+        """你是“招联客服知识库助手1000号”，请根据用户输入按下面规则输出中文答复：
+1) 若用户是寒暄/问候/确认在线（如“你好”“在吗”“hi”），请礼貌简短回复，并引导用户描述具体的招联办公/IT问题。
+2) 若用户问题与招联知识库主题无关，统一回复：该问题与当前招联知识库无关
+3) 若不确定是否相关，也按第2条回复。
+
+用户输入：
+{question}
+"""
+    )
+    oos_chain = oos_prompt | llm | StrOutputParser()
+    relevance_prompt = ChatPromptTemplate.from_template(
+        """你是检索结果相关性判定器。请判断【检索片段】是否能支持回答【用户问题】。
+只输出严格 JSON：{{"relevant": true/false, "reason": "一句话原因"}}，不要输出其他内容。
+
+判定规则：
+1) 若检索片段包含可直接回答问题的关键事实、步骤或定位线索，relevant=true。
+2) 若检索片段与问题主题不一致、只有非常泛化的弱关联、或不足以支持作答，relevant=false。
+3) 无法判断时，按 false。
+
+【用户问题】
+{question}
+
+【检索片段】
+{context}
+"""
+    )
+    relevance_chain = relevance_prompt | llm | StrOutputParser()
 
     summary_prompt = ChatPromptTemplate.from_template(
         """你是对话记忆压缩助手。请在不遗漏关键业务信息的前提下，压缩历史会话。
@@ -449,9 +597,59 @@ def create_rag_chain(retriever, llm):
     multi_top_k = int(os.getenv("MULTI_QUESTION_TOP_K", "3"))
     single_top_k = int(os.getenv("SINGLE_QUESTION_TOP_K", "4"))
     memory = {"summary": "", "turns": []}
+    kb_keywords = kb_keywords or set()
+    keyword_overlap_enabled = KEYWORD_OVERLAP_ENABLED and bool(kb_keywords)
 
     def _estimate_tokens(text: str) -> int:
         return max(1, len(text) // 2)
+
+    def _keyword_overlap_stats(text: str) -> Dict[str, Any]:
+        q_terms = _extract_keyword_terms(text, max_terms=40)
+        if not q_terms:
+            return {"terms": set(), "matched": set(), "ratio": 1.0}
+        matched = {t for t in q_terms if t in kb_keywords}
+        ratio = len(matched) / max(1, len(q_terms))
+        return {"terms": q_terms, "matched": matched, "ratio": ratio}
+
+    def _should_block_by_keyword(text: str) -> Dict[str, Any]:
+        if not keyword_overlap_enabled:
+            return {"block": False, "terms": set(), "matched": set(), "ratio": 1.0}
+        stats = _keyword_overlap_stats(text)
+        matched = stats["matched"]
+        block = len(matched) < KEYWORD_OVERLAP_MIN_MATCH
+        return {
+            "block": block,
+            "terms": stats["terms"],
+            "matched": matched,
+            "ratio": stats["ratio"],
+        }
+
+    def _fallback_non_retrieval_answer(question: str) -> str:
+        try:
+            return oos_chain.invoke({"question": question}).strip()
+        except Exception as e:
+            print(f"⚠️ 非检索分流模型调用失败，使用兜底文案: {e}")
+            return "该问题与当前招联知识库无关"
+
+    def _parse_relevance_output(raw: str) -> bool:
+        text = (raw or "").strip()
+        if not text:
+            return False
+        if text.startswith("```"):
+            text = text.removeprefix("```json").removeprefix("```").strip()
+            if text.endswith("```"):
+                text = text[:-3].strip()
+        try:
+            data = json.loads(text)
+        except Exception:
+            m = re.search(r"\{[\s\S]*\}", text)
+            if not m:
+                return False
+            try:
+                data = json.loads(m.group(0))
+            except Exception:
+                return False
+        return bool(data.get("relevant", False))
 
     def _doc_key(d: Document) -> tuple:
         m = d.metadata or {}
@@ -481,8 +679,8 @@ def create_rag_chain(retriever, llm):
             score_text = f" | {' | '.join(score_parts)}" if score_parts else ""
             blocks.append(f"[片段{i}] 来源: {source}{score_text}\n{(d.page_content or '').strip()}")
         context_text = "\n\n---\n\n".join(blocks)
-        print("检索到的内容:")
-        print(context_text)
+        # print("检索到的内容:")
+        # print(context_text)
         return context_text
 
     def _serialize_turns(turns: List[Dict[str, str]]) -> str:
@@ -575,10 +773,33 @@ def create_rag_chain(retriever, llm):
             )
         return records
 
+    def _remember_turn(question: str, answer: str) -> None:
+        """统一记录每一轮 Q/A，确保所有分支都进入 memory。"""
+        memory["turns"].append({"q": question, "a": answer})
+
     def _invoke_with_memory(question: str) -> Dict[str, Any]:
         # cmd = (question or "").strip().lower()
         # if cmd in MEMORY_DEBUG_CMDS:
         #     return _format_memory_debug()
+        keyword_gate = _should_block_by_keyword(question)
+        if keyword_gate["block"]:
+            print(
+                "🧱 关键词覆盖度过低，跳过检索: "
+                f"matched={len(keyword_gate['matched'])}/{len(keyword_gate['terms'])}"
+            )
+            answer = _fallback_non_retrieval_answer(question)
+            _remember_turn(question, answer)
+            return {
+                "answer": answer,
+                "docs": [],
+                "queries": [],
+                "skip_retrieval": True,
+                "keyword_overlap": {
+                    "matched_count": len(keyword_gate["matched"]),
+                    "term_count": len(keyword_gate["terms"]),
+                    "ratio": round(float(keyword_gate["ratio"]), 4),
+                },
+            }
 
         _compress_if_needed()
         history_text = _build_history_text()
@@ -590,6 +811,33 @@ def create_rag_chain(retriever, llm):
             queries = [question]
         if len(queries) > 1:
             print(f"🧩 基于记忆改写为多问句: {' | '.join(queries)}")
+
+        if keyword_overlap_enabled:
+            valid_queries = []
+            blocked_queries = []
+            for q in queries:
+                q_gate = _should_block_by_keyword(q)
+                if q_gate["block"]:
+                    blocked_queries.append(q)
+                else:
+                    valid_queries.append(q)
+            if blocked_queries:
+                print(f"🧱 子问题被关键词覆盖度拦截: {len(blocked_queries)} 条")
+            if not valid_queries:
+                answer = _fallback_non_retrieval_answer(question)
+                _remember_turn(question, answer)
+                return {
+                    "answer": answer,
+                    "docs": [],
+                    "queries": queries,
+                    "skip_retrieval": True,
+                    "keyword_overlap": {
+                        "matched_count": 0,
+                        "term_count": 0,
+                        "ratio": 0.0,
+                    },
+                }
+            queries = valid_queries
 
         # 多问句：每个问题分别混合检索+rerank，各取前 multi_top_k 条，再合并去重后全部给模型；单问句：检索取 top4
         if len(queries) > 1:
@@ -617,14 +865,41 @@ def create_rag_chain(retriever, llm):
             docs = retriever.invoke(queries[0])[:single_top_k]
 
         context = _format_docs(docs)
+        if not docs:
+            answer = "抱歉，数据库中不存在您要搜索的信息，我们会尽力添加"
+            _remember_turn(question, answer)
+            return {
+                "answer": answer,
+                "docs": [],
+                "queries": queries,
+                "skip_retrieval": True,
+                "post_retrieval_relevance": {"relevant": False},
+            }
+        try:
+            relevance_raw = relevance_chain.invoke({"question": question, "context": context})
+            relevant = _parse_relevance_output(relevance_raw)
+        except Exception as e:
+            print(f"⚠️ 检索后相关性判定失败，默认按相关处理: {e}")
+            relevant = True
+        if not relevant:
+            answer = "抱歉，数据库中中不存在您要搜索的信息，我们会尽力添加"
+            _remember_turn(question, answer)
+            return {
+                "answer": answer,
+                "docs": _to_doc_records(docs),
+                "queries": queries,
+                "skip_retrieval": True,
+                "post_retrieval_relevance": {"relevant": False},
+            }
         answer = answer_chain.invoke(
             {"context": context, "history": history_text, "question": question}
         )
-        memory["turns"].append({"q": question, "a": answer})
+        _remember_turn(question, answer)
         return {
             "answer": answer,
             "docs": _to_doc_records(docs),
             "queries": queries,
+            "post_retrieval_relevance": {"relevant": True},
         }
 
     return RunnableLambda(_invoke_with_memory)
@@ -647,6 +922,8 @@ def main():
     if not retriever:
         return
 
+    kb_keywords = build_kb_keyword_index(db)
+
     # 4. 初始化 LLM
     try:
         llm = ChatOpenAI(
@@ -660,9 +937,9 @@ def main():
     except Exception as e:
         print(f"❌ LLM 初始化失败: {e}")
         return
-    
+   
     # 5. 构建链
-    rag_chain = create_rag_chain(retriever, llm)
+    rag_chain = create_rag_chain(retriever, llm, kb_keywords=kb_keywords)
     
     # 6. 交互循环
     print("\n" + "="*50)
