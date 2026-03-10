@@ -19,7 +19,7 @@ from langchain_core.documents import Document
 load_dotenv()
 
 # ================= 配置区域（与 indexer.py 一致）=================
-BASE_DIR = r"E:\python_code\langchain"
+BASE_DIR = os.getenv("BASE_DIR", os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CHROMA_PATH_QIAN = os.path.join(BASE_DIR, "chroma_db_qwen3")
 DEFAULT_CHROMA_PATH_CUSTOM = os.path.join(BASE_DIR, "chroma_db_custom")
 
@@ -481,8 +481,8 @@ def create_rag_chain(retriever, llm):
             score_text = f" | {' | '.join(score_parts)}" if score_parts else ""
             blocks.append(f"[片段{i}] 来源: {source}{score_text}\n{(d.page_content or '').strip()}")
         context_text = "\n\n---\n\n".join(blocks)
-        # print("检索到的内容:")
-        # print(context_text)
+        print("检索到的内容:")
+        print(context_text)
         return context_text
 
     def _serialize_turns(turns: List[Dict[str, str]]) -> str:
