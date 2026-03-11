@@ -358,8 +358,9 @@ def create_hybrid_retriever(db):
                             Document(page_content=hit.page_content, metadata=meta)
                         )
 
-                vector_pairs = db.similarity_search_with_relevance_scores(sub_query, k=vector_k)
-                for rank, (doc, score) in enumerate(vector_pairs):
+                vector_pairs = db.similarity_search_with_score(sub_query, k=vector_k)
+                for rank, (doc, distance) in enumerate(vector_pairs):
+                    score = 1.0 / (1.0 + max(0.0, float(distance)))
                     metadata = dict(doc.metadata or {})
                     metadata["vector_relevance"] = round(float(score), 4)
                     metadata["vector_rank"] = rank + 1
@@ -492,7 +493,7 @@ def create_hybrid_retriever(db):
         print("仅使用向量检索...")
         return db.as_retriever(search_kwargs={"k": int(os.getenv('FINAL_TOP_K', '4'))})
 
-def create_rag_chain(retriever, llm, kb_keywords: Set[str] | None = None):
+def create_rag_chain(retriever, llm, kb_keywords: Set[str] | None = None, use_memory: bool = True):
     # 第一次调用：基于 memory 改写用户问题（单条或拆成多条）
     rewrite_template = """你是查询改写助手。根据【历史会话】理解用户当前问题的上下文，如果用户当前的问题中存在多个问题，将这多个问题拆成多条检索问句；若只有一个问题则保持一条（可结合上下文略作补全，不改变原意）。
     只输出严格 JSON，不要任何解释。格式：{{"queries": ["问句1", "问句2", ...]}}。
@@ -507,33 +508,19 @@ def create_rag_chain(retriever, llm, kb_keywords: Set[str] | None = None):
     rewrite_chain = rewrite_prompt | llm | StrOutputParser()
 
     # 第二次调用：根据参考信息生成最终回答
-    template = r"""你是招联客服知识库助手，请根据【参考信息】回答用户问题。
-你的目标是给出准确、清晰且可执行的处理指引。
-
-【历史会话摘要与最近对话】
-{history}
-
-回答策略与结构要求：
-1) **多问题拆解**：如果用户问题包含多个独立子问题（例如“怎么重置密码？另外报错代码0x800是什么意思？”），请分别针对每个子问题查找对应的参考信息，并分段进行回复，不要混为一谈。
-2) **动态内容结构**：根据内容类型自动选择最合适的格式，严禁机械地全部使用“步骤一、步骤二”：
-   - **操作指引类**（如“如何安装”、“怎么配置”）：必须使用步骤化输出（步骤 1、步骤 2...），每步一句到两句，简洁明确。
-   - **原因/概念/列表类**（如“为什么失败”、“有哪些政策”）：请使用分点列表（• 或 1. 2. 3.）进行阐述，清晰罗列关键点。
-   - **简单事实类**（如“服务台电话是多少”）：直接给出明确结论，无需分点或步骤。
-3) **图片路径严格规范**（最高优先级）：
-   - 触发条件：只要参考信息或生成的步骤中包含图片引用，必须紧跟在该相关段落/步骤后逐行输出。
-   - 格式要求：每张图片独占一行，严格格式为：`[图片地址] 绝对路径`
-   - 路径转换：
-     * 图片根目录固定为：“E:\python_code\langchain\plc”
-     * 若参考信息中是相对路径，必须拼接为该根目录下的绝对路径。
-     * **强烈建议统一使用正斜杠 `/` 输出路径**（例如 `E:/python_code/langchain/plc/.../image001.png`），防止转义错误。
-   - 完整性约束：
-     * 必须保留所有提到的图片，禁止丢失、合并或省略。
-     * 输出路径时必须保持原始字符完整，不得新增/删除字符，不得断行，不得把一个路径拆成两行。
-     * 若同一行中有多个 [图片地址] 标记，必须识别并分别单独输出为多行。
-   - 绝对路径示例：
-     [图片地址] E:/python_code/langchain/plc/知识库/it指引(1)/网络/无线网络/改了域密码后手机wifi连不上了/image001.png
-4) **真实性约束**：不要编造图片路径、系统入口、账号策略等信息。若参考信息不足，明确说明“知识库未提供完整信息”，并告知用户联系 IT 服务台。
-5) **语言风格**：专业、礼貌、面向业务同事，避免过度技术黑话。
+    template = """你是招联客服知识库助手，请根据【参考信息】回答用户问题。
+    若参考信息与用户问题无关（无法从中找到答案），请直接且仅回复：“抱歉，当前招联IT数据库中不存在您要搜索的信息，我们会尽力添加”，不要编造任何内容。
+    如果参考信息与用户问题有关，则遵循如下回答策略与结构要求：
+    1) 多问题拆解：如果用户问题包含多个独立子问题，请分别针对每个子问题查找对应的参考信息，并分段进行回复，不要混为一谈。
+    2) 动态内容结构：回答应逻辑清晰，凡适合分点阐述的内容（如操作步骤、原因列表、多项事实等），请务必使用分点格式输出；仅当内容为单一简短结论时，可直接陈述。
+    3) 图片引用规范 (最高优先级)：
+    - 触发：只要内容涉及图片，必须在相关段落/步骤后立即换行输出。
+    - 格式：独占一行，严格格式为 `[图片地址] 相对路径`
+    - 路径处理：直接使用参考信息中的原始相对路径，禁止拼接根目录或转换为绝对路径，禁止额外加入空格，统一使用正斜杠 `/`。
+    - 完整性：提到几张图就输出几行，严禁遗漏或合并。
+    - 例如：[图片地址] ../../../../../../plc/知识库/it指引(1)/网络/无线网络/改了域密码后手机wifi连不上了/image001.png
+    5) 真实性约束：不要编造图片路径、系统入口、账号策略等信息。
+    6) 语言风格：专业、礼貌、面向业务同事，避免过度技术黑话。
 
 【参考信息】
 {context}
@@ -547,8 +534,8 @@ def create_rag_chain(retriever, llm, kb_keywords: Set[str] | None = None):
     answer_chain = prompt | llm | StrOutputParser()
     oos_prompt = ChatPromptTemplate.from_template(
         """你是“招联客服知识库助手1000号”，请根据用户输入按下面规则输出中文答复：
-1) 若用户是寒暄/问候/确认在线（如“你好”“在吗”“hi”），请礼貌简短回复，并引导用户描述具体的招联办公/IT问题。
-2) 若用户问题与招联知识库主题无关，统一回复：该问题与当前招联知识库无关
+1) 若用户是寒暄/问候/确认在线（如“你好”“在吗”“hi”），请礼貌简短回复，并引导用户描述具体的IT问题。
+2) 若用户问题与招联知识库主题无关，统一回复：抱歉，当前招联IT数据库中不存在您要搜索的信息，我们会尽力添加
 3) 若不确定是否相关，也按第2条回复。
 
 用户输入：
@@ -556,24 +543,6 @@ def create_rag_chain(retriever, llm, kb_keywords: Set[str] | None = None):
 """
     )
     oos_chain = oos_prompt | llm | StrOutputParser()
-    relevance_prompt = ChatPromptTemplate.from_template(
-        """你是检索结果相关性判定器。请判断【检索片段】是否能支持回答【用户问题】。
-只输出严格 JSON：{{"relevant": true/false, "reason": "一句话原因"}}，不要输出其他内容。
-
-判定规则：
-1) 若检索片段包含可直接回答问题的关键事实、步骤或定位线索，relevant=true。
-2) 若检索片段与问题主题不一致、只有非常泛化的弱关联、或不足以支持作答，relevant=false。
-3) 无法判断时，按 false。
-
-【用户问题】
-{question}
-
-【检索片段】
-{context}
-"""
-    )
-    relevance_chain = relevance_prompt | llm | StrOutputParser()
-
     summary_prompt = ChatPromptTemplate.from_template(
         """你是对话记忆压缩助手。请在不遗漏关键业务信息的前提下，压缩历史会话。
 
@@ -630,26 +599,6 @@ def create_rag_chain(retriever, llm, kb_keywords: Set[str] | None = None):
         except Exception as e:
             print(f"⚠️ 非检索分流模型调用失败，使用兜底文案: {e}")
             return "该问题与当前招联知识库无关"
-
-    def _parse_relevance_output(raw: str) -> bool:
-        text = (raw or "").strip()
-        if not text:
-            return False
-        if text.startswith("```"):
-            text = text.removeprefix("```json").removeprefix("```").strip()
-            if text.endswith("```"):
-                text = text[:-3].strip()
-        try:
-            data = json.loads(text)
-        except Exception:
-            m = re.search(r"\{[\s\S]*\}", text)
-            if not m:
-                return False
-            try:
-                data = json.loads(m.group(0))
-            except Exception:
-                return False
-        return bool(data.get("relevant", False))
 
     def _doc_key(d: Document) -> tuple:
         m = d.metadata or {}
@@ -777,69 +726,72 @@ def create_rag_chain(retriever, llm, kb_keywords: Set[str] | None = None):
         """统一记录每一轮 Q/A，确保所有分支都进入 memory。"""
         memory["turns"].append({"q": question, "a": answer})
 
+    def _merge_queries(queries: List[str]) -> str:
+        if not queries:
+            return ""
+        if len(queries) == 1:
+            return queries[0]
+        return "；".join(f"{i + 1}. {q}" for i, q in enumerate(queries))
+
     def _invoke_with_memory(question: str) -> Dict[str, Any]:
         # cmd = (question or "").strip().lower()
         # if cmd in MEMORY_DEBUG_CMDS:
         #     return _format_memory_debug()
+        t_total_start = time.perf_counter()
+
+        # 门控基于“原始用户问题”，且在任何检索前执行
         keyword_gate = _should_block_by_keyword(question)
         if keyword_gate["block"]:
             print(
                 "🧱 关键词覆盖度过低，跳过检索: "
                 f"matched={len(keyword_gate['matched'])}/{len(keyword_gate['terms'])}"
             )
+            t_oos_start = time.perf_counter()
             answer = _fallback_non_retrieval_answer(question)
-            _remember_turn(question, answer)
+            oos_ms = round((time.perf_counter() - t_oos_start) * 1000, 1)
+            total_ms = round((time.perf_counter() - t_total_start) * 1000, 1)
+            print(f"⏱️ 耗时统计 | 门控分流: {oos_ms} ms | 总计: {total_ms} ms")
+            if use_memory:
+                _remember_turn(question, answer)
             return {
                 "answer": answer,
                 "docs": [],
                 "queries": [],
+                "rewritten_question": question,
                 "skip_retrieval": True,
                 "keyword_overlap": {
                     "matched_count": len(keyword_gate["matched"]),
                     "term_count": len(keyword_gate["terms"]),
                     "ratio": round(float(keyword_gate["ratio"]), 4),
                 },
+                "timings_ms": {
+                    "rewrite": 0.0,
+                    "retrieve": 0.0,
+                    "answer": oos_ms,
+                    "total": total_ms,
+                },
             }
 
-        _compress_if_needed()
-        history_text = _build_history_text()
+        if use_memory:
+            _compress_if_needed()
+            history_text = _build_history_text()
+        else:
+            history_text = "【摘要】\n无\n\n【最近对话】\n无"
 
         # 第一次 LLM：基于 memory 改写/拆分为 1～N 个检索问句
+        t_rewrite_start = time.perf_counter()
         raw_rewrite = rewrite_chain.invoke({"history": history_text, "question": question})
+        rewrite_ms = round((time.perf_counter() - t_rewrite_start) * 1000, 1)
         queries = _parse_rewrite_output(raw_rewrite)
         if not queries:
             queries = [question]
+        rewritten_question = _merge_queries(queries)
+        print(f"✏️ 改写后问题: {rewritten_question}")
         if len(queries) > 1:
             print(f"🧩 基于记忆改写为多问句: {' | '.join(queries)}")
 
-        if keyword_overlap_enabled:
-            valid_queries = []
-            blocked_queries = []
-            for q in queries:
-                q_gate = _should_block_by_keyword(q)
-                if q_gate["block"]:
-                    blocked_queries.append(q)
-                else:
-                    valid_queries.append(q)
-            if blocked_queries:
-                print(f"🧱 子问题被关键词覆盖度拦截: {len(blocked_queries)} 条")
-            if not valid_queries:
-                answer = _fallback_non_retrieval_answer(question)
-                _remember_turn(question, answer)
-                return {
-                    "answer": answer,
-                    "docs": [],
-                    "queries": queries,
-                    "skip_retrieval": True,
-                    "keyword_overlap": {
-                        "matched_count": 0,
-                        "term_count": 0,
-                        "ratio": 0.0,
-                    },
-                }
-            queries = valid_queries
-
         # 多问句：每个问题分别混合检索+rerank，各取前 multi_top_k 条，再合并去重后全部给模型；单问句：检索取 top4
+        t_retrieve_start = time.perf_counter()
         if len(queries) > 1:
             all_docs: List[Document] = []
             max_workers = max(1, min(int(os.getenv("MULTI_RETRIEVAL_MAX_WORKERS", "4")), len(queries)))
@@ -863,43 +815,54 @@ def create_rag_chain(retriever, llm, kb_keywords: Set[str] | None = None):
             docs = sorted(merged.values(), key=_doc_score, reverse=True)
         else:
             docs = retriever.invoke(queries[0])[:single_top_k]
+        retrieve_ms = round((time.perf_counter() - t_retrieve_start) * 1000, 1)
 
         context = _format_docs(docs)
         if not docs:
             answer = "抱歉，数据库中不存在您要搜索的信息，我们会尽力添加"
-            _remember_turn(question, answer)
+            total_ms = round((time.perf_counter() - t_total_start) * 1000, 1)
+            print(
+                "⏱️ 耗时统计 | "
+                f"改写: {rewrite_ms} ms | 检索: {retrieve_ms} ms | 生成: 0.0 ms | 总计: {total_ms} ms"
+            )
+            if use_memory:
+                _remember_turn(rewritten_question, answer)
             return {
                 "answer": answer,
                 "docs": [],
                 "queries": queries,
+                "rewritten_question": rewritten_question,
                 "skip_retrieval": True,
-                "post_retrieval_relevance": {"relevant": False},
+                "timings_ms": {
+                    "rewrite": rewrite_ms,
+                    "retrieve": retrieve_ms,
+                    "answer": 0.0,
+                    "total": total_ms,
+                },
             }
-        try:
-            relevance_raw = relevance_chain.invoke({"question": question, "context": context})
-            relevant = _parse_relevance_output(relevance_raw)
-        except Exception as e:
-            print(f"⚠️ 检索后相关性判定失败，默认按相关处理: {e}")
-            relevant = True
-        if not relevant:
-            answer = "抱歉，数据库中中不存在您要搜索的信息，我们会尽力添加"
-            _remember_turn(question, answer)
-            return {
-                "answer": answer,
-                "docs": _to_doc_records(docs),
-                "queries": queries,
-                "skip_retrieval": True,
-                "post_retrieval_relevance": {"relevant": False},
-            }
+        t_answer_start = time.perf_counter()
         answer = answer_chain.invoke(
-            {"context": context, "history": history_text, "question": question}
+            {"context": context, "history": history_text, "question": rewritten_question}
         )
-        _remember_turn(question, answer)
+        answer_ms = round((time.perf_counter() - t_answer_start) * 1000, 1)
+        total_ms = round((time.perf_counter() - t_total_start) * 1000, 1)
+        print(
+            "⏱️ 耗时统计 | "
+            f"改写: {rewrite_ms} ms | 检索: {retrieve_ms} ms | 生成: {answer_ms} ms | 总计: {total_ms} ms"
+        )
+        if use_memory:
+            _remember_turn(rewritten_question, answer)
         return {
             "answer": answer,
             "docs": _to_doc_records(docs),
             "queries": queries,
-            "post_retrieval_relevance": {"relevant": True},
+            "rewritten_question": rewritten_question,
+            "timings_ms": {
+                "rewrite": rewrite_ms,
+                "retrieve": retrieve_ms,
+                "answer": answer_ms,
+                "total": total_ms,
+            },
         }
 
     return RunnableLambda(_invoke_with_memory)

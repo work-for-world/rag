@@ -8,6 +8,7 @@ import streamlit as st
 from chatbox import (
     LLM_API_KEY,
     LLM_BASE_URL,
+    build_kb_keyword_index,
     create_embeddings,
     create_hybrid_retriever,
     create_rag_chain,
@@ -101,12 +102,12 @@ def resolve_image_path(raw_path: str, workspace_root: Path) -> Path | None:
 
     normalized = cleaned.replace("\\", "/")
 
-    # 处理 Windows 绝对路径，如 E:\python_code\langchain\plc\...
+    # 统一处理为“相对路径优先”再回退到绝对路径兼容
     normalized_no_drive = re.sub(r"^[A-Za-z]:/+", "", normalized)
+    normalized_rel = _drop_leading_rel(normalized.lstrip("./"))
     candidates = [
-        workspace_root / normalized,
+        workspace_root / normalized_rel,
         workspace_root / normalized.lstrip("./"),
-        workspace_root / _drop_leading_rel(normalized),
         workspace_root / normalized_no_drive,
     ]
 
@@ -149,7 +150,7 @@ def _looks_like_path_prefix(text: str) -> bool:
     stripped = text.strip()
     if not stripped or IMAGE_EXT_PATTERN.search(stripped):
         return False
-    return bool(re.match(r"^(?:[A-Za-z]:[\\/]|(?:\.\./|/)?plc[\\/]).+", stripped))
+    return bool(re.match(r"^(?:[A-Za-z]:[\\/]|(?:(?:\.\./)+|/)?plc[\\/]).+", stripped))
 
 
 def _looks_like_rel_image_fragment(text: str) -> bool:
@@ -209,7 +210,8 @@ def get_rag_chain():
     if not retriever:
         raise RuntimeError("检索器构建失败，请检查依赖与环境变量配置。")
 
-    rag_chain = create_rag_chain(retriever, _create_llm())
+    kb_keywords = build_kb_keyword_index(db)
+    rag_chain = create_rag_chain(retriever, _create_llm(), kb_keywords=kb_keywords)
     return rag_chain
 
 
