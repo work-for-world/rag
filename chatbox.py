@@ -494,20 +494,20 @@ def create_hybrid_retriever(db):
         return db.as_retriever(search_kwargs={"k": int(os.getenv('FINAL_TOP_K', '4'))})
 
 def create_rag_chain(retriever, llm, kb_keywords: Set[str] | None = None, use_memory: bool = True):
-    # 第一次调用：基于 memory 改写用户问题（单条或拆成多条）
+    # 第一次调用：基于近期 memory 改写用户问题（单条或拆成多条）
     rewrite_template = """你是查询改写助手。根据【历史会话】理解用户当前问题的上下文，如果用户当前的问题中存在多个问题，将这多个问题拆成多条检索问句；若只有一个问题则保持一条（可结合上下文略作补全，不改变原意）。
-    只输出严格 JSON，不要任何解释。格式：{{"queries": ["问句1", "问句2", ...]}}。
+只输出严格 JSON，不要任何解释。格式：{{"queries": ["问句1", "问句2", ...]}}。
 
-    【历史会话】
-    {history}
+【历史会话】
+{history}
 
-    【用户当前问题】
-    {question}
-    """
+【用户当前问题】
+{question}
+"""
     rewrite_prompt = ChatPromptTemplate.from_template(rewrite_template)
     rewrite_chain = rewrite_prompt | llm | StrOutputParser()
 
-    # 第二次调用：根据参考信息生成最终回答
+    # 根据参考信息生成最终回答
     template = """你是招联客服知识库助手，请根据【参考信息】回答用户问题。
     若参考信息与用户问题无关（无法从中找到答案），请直接且仅回复：“抱歉，当前招联IT数据库中不存在您要搜索的信息，我们会尽力添加”，不要编造任何内容。
     如果参考信息与用户问题有关，则遵循如下回答策略与结构要求：
@@ -519,8 +519,8 @@ def create_rag_chain(retriever, llm, kb_keywords: Set[str] | None = None, use_me
     - 路径处理：直接使用参考信息中的原始相对路径，禁止拼接根目录或转换为绝对路径，禁止额外加入空格，统一使用正斜杠 `/`。
     - 完整性：提到几张图就输出几行，严禁遗漏或合并。
     - 例如：[图片地址] ../../../../../../plc/知识库/it指引(1)/网络/无线网络/改了域密码后手机wifi连不上了/image001.png
-    5) 真实性约束：不要编造图片路径、系统入口、账号策略等信息。
-    6) 语言风格：专业、礼貌、面向业务同事，避免过度技术黑话。
+    4) 真实性约束：不要编造图片路径、系统入口、账号策略等信息。
+    5) 语言风格：专业、礼貌、面向业务同事，避免过度技术黑话。
 
 【参考信息】
 {context}
@@ -543,34 +543,12 @@ def create_rag_chain(retriever, llm, kb_keywords: Set[str] | None = None, use_me
 """
     )
     oos_chain = oos_prompt | llm | StrOutputParser()
-    summary_prompt = ChatPromptTemplate.from_template(
-        """你是对话记忆压缩助手。请在不遗漏关键业务信息的前提下，压缩历史会话。
-
-        已有摘要：
-        {existing_summary}
-
-        新增对话：
-        {new_turns}
-
-        请输出更新后的精简摘要，要求：
-        1) 保留用户目标、已确认事实、关键约束、未解决问题；
-        2) 删除寒暄和重复表达；
-        3) 使用中文，控制在 {max_tokens} token 以内（尽量简洁）。
-"""
-    )
-    summary_chain = summary_prompt | llm | StrOutputParser()
-
-    max_history_tokens = int(os.getenv("HISTORY_MAX_TOKENS", "1600"))
-    summary_max_tokens = int(os.getenv("HISTORY_SUMMARY_MAX_TOKENS", "600"))
-    keep_recent_turns = int(os.getenv("HISTORY_KEEP_RECENT_TURNS", "4"))
+    keep_recent_turns = 3
     multi_top_k = int(os.getenv("MULTI_QUESTION_TOP_K", "3"))
     single_top_k = int(os.getenv("SINGLE_QUESTION_TOP_K", "4"))
-    memory = {"summary": "", "turns": []}
+    memory = {"turns": []}
     kb_keywords = kb_keywords or set()
     keyword_overlap_enabled = KEYWORD_OVERLAP_ENABLED and bool(kb_keywords)
-
-    def _estimate_tokens(text: str) -> int:
-        return max(1, len(text) // 2)
 
     def _keyword_overlap_stats(text: str) -> Dict[str, Any]:
         q_terms = _extract_keyword_terms(text, max_terms=40)
@@ -640,53 +618,9 @@ def create_rag_chain(retriever, llm, kb_keywords: Set[str] | None = None, use_me
         return "\n".join(lines).strip()
 
     def _build_history_text() -> str:
-        recent = memory["turns"][-keep_recent_turns:] if keep_recent_turns > 0 else memory["turns"]
+        recent = memory["turns"][-keep_recent_turns:]
         recent_text = _serialize_turns(recent) if recent else "无"
-        summary_text = memory["summary"].strip() or "无"
-        return f"【摘要】\n{summary_text}\n\n【最近对话】\n{recent_text}"
-
-    # def _format_memory_debug() -> str:
-    #     """调试用：返回当前 memory 的完整内容，便于核对是否存储正确。"""
-    #     summary = memory["summary"].strip() or "（空）"
-    #     turns = memory["turns"]
-    #     lines = [
-    #         "========== Memory 调试信息 ==========",
-    #         "（以下为 memory 中实际存储的完整内容，未截断）",
-    #         f"【摘要】共 {len(summary)} 字",
-    #         summary if summary != "（空）" else summary,
-    #         "",
-    #         f"【完整对话轮次】共 {len(turns)} 轮",
-    #     ]
-    #     for i, t in enumerate(turns, 1):
-    #         q = (t.get("q") or "").strip()
-    #         a = (t.get("a") or "").strip()
-    #         lines.append(f"--- 第 {i} 轮 ---")
-    #         lines.append(f"用户: {q}")
-    #         lines.append(f"助手: {a}")
-    #         lines.append("")
-    #     recent = memory["turns"][-keep_recent_turns:] if keep_recent_turns > 0 else memory["turns"]
-    #     history_preview = _build_history_text()
-    #     lines.append(f"【注入给模型的 history 估算】约 {_estimate_tokens(history_preview)} tokens（最近 {len(recent)} 轮 + 摘要）")
-    #     lines.append("====================================")
-    #     return "\n".join(lines)
-
-    def _compress_if_needed() -> None:
-        history_text = _build_history_text()
-        if _estimate_tokens(history_text) <= max_history_tokens:
-            return
-        old_turns_text = _serialize_turns(memory["turns"])
-        if not old_turns_text:
-            return
-        # print("🧠 历史会话过长，正在自动压缩记忆...")
-        new_summary = summary_chain.invoke(
-            {
-                "existing_summary": memory["summary"] or "无",
-                "new_turns": old_turns_text,
-                "max_tokens": summary_max_tokens,
-            }
-        ).strip()
-        memory["summary"] = new_summary
-        memory["turns"] = memory["turns"][-keep_recent_turns:] if keep_recent_turns > 0 else []
+        return f"【最近对话】\n{recent_text}"
 
     def _parse_rewrite_output(raw: str) -> List[str]:
         raw = (raw or "").strip()
@@ -704,8 +638,6 @@ def create_rag_chain(retriever, llm, kb_keywords: Set[str] | None = None, use_me
         except Exception:
             pass
         return []
-
-    # MEMORY_DEBUG_CMDS = ("memory", "mem", "debug", "查看记忆")
 
     def _to_doc_records(docs: List[Document]) -> List[Dict[str, Any]]:
         records: List[Dict[str, Any]] = []
@@ -725,6 +657,8 @@ def create_rag_chain(retriever, llm, kb_keywords: Set[str] | None = None, use_me
     def _remember_turn(question: str, answer: str) -> None:
         """统一记录每一轮 Q/A，确保所有分支都进入 memory。"""
         memory["turns"].append({"q": question, "a": answer})
+        if len(memory["turns"]) > keep_recent_turns:
+            memory["turns"] = memory["turns"][-keep_recent_turns:]
 
     def _merge_queries(queries: List[str]) -> str:
         if not queries:
@@ -734,9 +668,6 @@ def create_rag_chain(retriever, llm, kb_keywords: Set[str] | None = None, use_me
         return "；".join(f"{i + 1}. {q}" for i, q in enumerate(queries))
 
     def _invoke_with_memory(question: str) -> Dict[str, Any]:
-        # cmd = (question or "").strip().lower()
-        # if cmd in MEMORY_DEBUG_CMDS:
-        #     return _format_memory_debug()
         t_total_start = time.perf_counter()
 
         # 门控基于“原始用户问题”，且在任何检索前执行
@@ -773,24 +704,29 @@ def create_rag_chain(retriever, llm, kb_keywords: Set[str] | None = None, use_me
             }
 
         if use_memory:
-            _compress_if_needed()
             history_text = _build_history_text()
         else:
-            history_text = "【摘要】\n无\n\n【最近对话】\n无"
+            history_text = "【最近对话】\n无"
 
-        # 第一次 LLM：基于 memory 改写/拆分为 1～N 个检索问句
-        t_rewrite_start = time.perf_counter()
-        raw_rewrite = rewrite_chain.invoke({"history": history_text, "question": question})
-        rewrite_ms = round((time.perf_counter() - t_rewrite_start) * 1000, 1)
-        queries = _parse_rewrite_output(raw_rewrite)
-        if not queries:
+        # 首轮（无历史）或关闭 memory 时，跳过问题改写以降低时延
+        has_history = use_memory and bool(memory["turns"])
+        if has_history:
+            t_rewrite_start = time.perf_counter()
+            raw_rewrite = rewrite_chain.invoke({"history": history_text, "question": question})
+            rewrite_ms = round((time.perf_counter() - t_rewrite_start) * 1000, 1)
+            queries = _parse_rewrite_output(raw_rewrite)
+            if not queries:
+                queries = [question]
+            rewritten_question = _merge_queries(queries)
+            print(f"✏️ 改写后问题: {rewritten_question}")
+            if len(queries) > 1:
+                print(f"🧩 基于记忆改写为多问句: {' | '.join(queries)}")
+        else:
+            rewrite_ms = 0.0
             queries = [question]
-        rewritten_question = _merge_queries(queries)
-        print(f"✏️ 改写后问题: {rewritten_question}")
-        if len(queries) > 1:
-            print(f"🧩 基于记忆改写为多问句: {' | '.join(queries)}")
+            rewritten_question = question
 
-        # 多问句：每个问题分别混合检索+rerank，各取前 multi_top_k 条，再合并去重后全部给模型；单问句：检索取 top4
+        # 多问句分别检索再合并去重；单问句直接检索
         t_retrieve_start = time.perf_counter()
         if len(queries) > 1:
             all_docs: List[Document] = []
